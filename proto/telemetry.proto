@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package telemetry;
+
+// -------------------------------------------------------------
+// SERVICES
+// -------------------------------------------------------------
+
+// Ingestion Path: Edge Devices/Mock Engines -> Ingestion Service
+service TelemetryIngestionService {
+  rpc StreamTelemetry (TelemetryPacket) returns (IngestionResponse);
+}
+
+// Control Plane Path: Action Gateway -> Edge Devices/Mock Engines
+service MockEngineControlService {
+  rpc ExecuteCommand (GridControlCommand) returns (CommandAcknowledgement);
+}
+
+// -------------------------------------------------------------
+// CORE DATA PACKETS
+// -------------------------------------------------------------
+
+message TelemetryPacket {
+  string meter_id = 1;
+  double voltage = 2;
+  double current = 3;
+  double consumption_rate = 4; // kW
+  int64 timestamp = 5;
+}
+
+message IngestionResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Standardized Base Telemetry Domain Event
+message TelemetryDomainEvent {
+  string event_id = 1; // Idempotency key
+  string meter_id = 2;
+  double voltage = 3;
+  double current = 4;
+  double consumption_rate = 5;
+  int64 timestamp = 6;
+}
+
+// -------------------------------------------------------------
+// SPECIALIZED DOWNSTREAM KAFKA EVENTS
+// -------------------------------------------------------------
+
+// Real-Time Analysis Topic Messages (emergency-alerts)
+message EmergencyAlertEvent {
+  string event_id = 1;
+  string meter_id = 2;
+  string alert_type = 3; // "VoltageSpikeDetected" or "EmergencyDetected"
+  double trigger_value = 4;
+  int64 timestamp = 5;
+}
+
+// Trend & Regional Analysis Topic Messages (trend-region-events)
+message TrendRegionEvent {
+  string event_id = 1;
+  string region_id = 2; // Derived from meter groups
+  string anomaly_type = 3; // "RegionalOverloadDetected", "SuspiciousConsumptionPattern", "GridInstabilityDetected"
+  double moving_average = 4;
+  int64 timestamp = 5;
+}
+
+// -------------------------------------------------------------
+// BIDIRECTIONAL COMMAND STRUCTURES
+// -------------------------------------------------------------
+
+enum CommandType {
+  UNKNOWN = 0;
+  CUT_POWER = 1;          // CutPowerCommand
+  RESTART_METER = 2;      // RestartMeterCommand
+  THROTTLE_CONSUMPTION = 3; // ThrottleConsumptionCommand
+}
+
+message GridControlCommand {
+  string command_id = 1;  // Traced to event_id for idempotency
+  string meter_id = 2;
+  CommandType type = 3;
+  string details = 4;
+}
+
+message CommandAcknowledgement {
+  string command_id = 1;
+  string meter_id = 2;
+  bool success = 3;
+  int64 ack_timestamp = 4;
+}

@@ -1,0 +1,76 @@
+name: SmartGrid Sentinel CI Core Pipeline
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  # --- STAGE 1: CODE QUALITY, LINTING, & PROTOBUF VALIDATION ---
+  lint-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Monorepo Codebase
+        uses: actions/checkout@v3
+
+      - name: Setup Python Environment
+        uses: actions/setup-python@v4
+        with:
+          python-node-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Base and Tooling Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 grpcio-tools
+
+      - name: Execute Linting Syntax Audit
+        run: |
+          # stop the build if there are Python syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # exit-zero treats all warnings as advice, preventing style nitpicks from blocking development
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Validate Protocol Buffer Schema Compilation
+        run: |
+          # Compiles proto structures dynamically to ensure no breaking structural variations exist
+          python -m grpc_tools.protoc \
+            --proto_path=services/ingestion \
+            --python_out=services/ingestion \
+            --grpc_python_out=services/ingestion \
+            services/ingestion/telemetry.proto
+          echo "✅ Protobuf schema interface compiled successfully without structural regressions."
+
+  # --- STAGE 2: CONTAINER DEPLOYMENT INTEGRITY VERIFICATION ---
+  docker-build-matrix:
+    needs: lint-and-validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Define a build execution matrix to compile all services concurrently
+        service: [
+          "ingestion",
+          "real_time_analysis",
+          "trend_regional_analysis",
+          "action_gateway",
+          "management_api",
+          "mock_engine",
+          "dlq_monitor"
+        ]
+    steps:
+      - name: Checkout Monorepo Codebase
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: actions/docker-setup-buildx-action@v2
+
+      - name: Verify Service Container Construction
+        uses: docker/build-push-action@v4
+        with:
+          context: ./services/${{ matrix.service }}
+          file: ./services/${{ matrix.service }}/Dockerfile
+          push: false  # Do not push images to a registry during testing validation stages
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

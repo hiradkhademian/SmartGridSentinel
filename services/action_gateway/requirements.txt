@@ -1,0 +1,5 @@
+grpcio==1.62.1
+aiokafka==0.10.0
+protobuf==4.25.3
+sqlalchemy==2.0.29
+asyncpg==0.29.0

@@ -1,0 +1,92 @@
+services:
+  # --- INFRASTRUCTURE DATA CORES ---
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: sentinel_admin
+      POSTGRES_PASSWORD: sentinel_password
+      POSTGRES_DB: smartgrid_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # --- CUSTOM GRID MICROSERVICES ---
+  ingestion-service:
+    build: ./services/ingestion
+    ports:
+      - "50051:50051"
+    environment:
+      KAFKA_BROKER: "kafka:29092"
+    depends_on:
+      - kafka
+    restart: on-failure
+
+  real-time-analysis:
+    build: ./services/real_time_analysis
+    environment:
+      KAFKA_BROKER: "kafka:29092"
+    depends_on:
+      - kafka
+    restart: on-failure
+
+  trend-regional-analysis:
+    build: ./services/trend_regional_analysis
+    environment:
+      KAFKA_BROKER: "kafka:29092"
+      REDIS_URL: "redis://redis:6379"
+    depends_on:
+      - kafka
+      - redis
+    restart: on-failure
+
+  action-gateway:
+    build: ./services/action_gateway
+    environment:
+      KAFKA_BROKER: "kafka:29092"
+      DATABASE_URL: "postgresql+asyncpg://sentinel_admin:sentinel_password@postgres:5432/smartgrid_db"
+      MOCK_ENGINE_CONTROL_ADDR: "mock-engine:50052"
+    depends_on:
+      - kafka
+      - postgres
+      - mock-engine
+    restart: on-failure
+
+  mock-engine:
+    build: ./services/mock_engine
+    command: ["python", "simulator.py"]
+    ports:
+      - "50052:50052"
+    environment:
+      INGESTION_SERVER_ADDR: "ingestion-service:50051"
+      CONTROL_PORT: "[::]:50052"
+    depends_on:
+      - ingestion-service
+
+volumes:
+  pgdata:
