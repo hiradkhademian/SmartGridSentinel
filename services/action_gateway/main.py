@@ -33,7 +33,7 @@ class CommandAuditLog(Base):
     command_type: Mapped[str] = mapped_column(String(50), nullable=False)
     details: Mapped[str] = mapped_column(String(255), nullable=False)
     executed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    ack_received: Mapped[bool] = mapped_column(DateTime, nullable=True)
+    ack_received: Mapped[datetime] = mapped_column(DateTime, nullable=True)
 
 
 # --- Observer Design Pattern for Connection Management ---
@@ -141,7 +141,8 @@ async def handle_incoming_pipeline(consumer: AIOKafkaConsumer, subject: GridCont
                                 event_id=command.command_id,
                                 target_id=command.meter_id,
                                 command_type=cmd_name,
-                                details=command.details
+                                details=command.details,
+                                ack_received=datetime.utcnow()
                             )
                             await session.merge(audit)
                     logging.info(f"💾 Command audit log recorded cleanly for transaction {command.command_id}.")
@@ -172,7 +173,8 @@ async def handle_incoming_pipeline(consumer: AIOKafkaConsumer, subject: GridCont
                                 event_id=command.command_id,
                                 target_id=command.meter_id,
                                 command_type="ThrottleConsumptionCommand",
-                                details=command.details
+                                details=command.details,
+                                ack_received=datetime.utcnow()
                             )
                             await session.merge(audit)
 

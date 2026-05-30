@@ -3,6 +3,8 @@ import logging
 import uuid
 import os
 import grpc
+import re    
+import time
 from aiokafka import AIOKafkaProducer
 
 # Import our compiled protobuf classes
@@ -50,11 +52,22 @@ class TelemetryIngestionServicer(telemetry_pb2_grpc.TelemetryIngestionServiceSer
                 return telemetry_pb2.IngestionResponse(success=False, message="DLQ internal error.")
 
         # --- 2. STANDARD RUNTIME VALIDATION (Anti-Corruption Layer Pattern) ---
-        if not request.meter_id or request.voltage <= 0:
-            logging.warning(f"Rejected invalid packet from meter: {request.meter_id}")
+        # 1. Meter ID format validation (e.g., METER-01H, must start with METER- followed by alphanumerics)
+        is_valid_meter_id = bool(request.meter_id and re.match(r"^METER-[0-9A-Z]+$", request.meter_id))
+        
+        # 2. Metrics validation (Voltage must be > 0. Current and consumption can be 0 but not negative)
+        is_valid_metrics = request.voltage > 0 and request.current >= 0 and request.consumption_rate >= 0
+        
+        # 3. Timestamp validity window (Must be within the last 24 hours, with a max 60 sec tolerance for future time due to device clock drift)
+        current_time = int(time.time())
+        is_valid_timestamp = (current_time - 86400) <= (request.timestamp / 1000) <= (current_time + 60)
+
+        # Reject the packet if any of the rules are violated
+        if not (is_valid_meter_id and is_valid_metrics and is_valid_timestamp):
+            logging.warning(f"Rejected invalid packet from meter: {request.meter_id} | V:{request.voltage} I:{request.current} C:{request.consumption_rate} T:{request.timestamp}")
             return telemetry_pb2.IngestionResponse(
                 success=False, 
-                message="Invalid telemetry data fields."
+                message="Invalid telemetry data fields, formatting, or temporal anomalies."
             )
 
         try:
