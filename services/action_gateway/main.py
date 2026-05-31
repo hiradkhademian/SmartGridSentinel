@@ -4,7 +4,7 @@ from datetime import datetime
 import os
 import uuid
 import grpc
-from aiokafka import AIOKafkaConsumer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base, Mapped, mapped_column
 from sqlalchemy import String, Float, DateTime
@@ -19,7 +19,7 @@ KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
 ALERT_TOPIC = "emergency-alerts"
 TREND_TOPIC = "trend-region-events"
 MOCK_ENGINE_CONTROL_ADDR = os.getenv("MOCK_ENGINE_CONTROL_ADDR", "localhost:50052")
-
+ACTION_GATEWAY_DLQ = "action-gateway-dlq"
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://sentinel_admin:sentinel_password@localhost:5432/smartgrid_db")
 
 Base = declarative_base()
@@ -89,8 +89,28 @@ class GridControlSubject:
                 return True
         return False
 
+# --- DLQ Routing ---
+async def route_to_dlq(
+    producer: AIOKafkaProducer,
+    raw_bytes: bytes,
+    reason: str
+):
+    try:
+        logging.error(
+            f"❌ Action Gateway DLQ Triggered: {reason}"
+        )
+
+        await producer.send_and_wait(
+            ACTION_GATEWAY_DLQ,
+            raw_bytes
+        )
+
+    except Exception as e:
+        logging.critical(
+            f"Action Gateway DLQ write failed: {e}"
+        )
 # --- Event Processing Pipelines ---
-async def handle_incoming_pipeline(consumer: AIOKafkaConsumer, subject: GridControlSubject, session_factory: async_sessionmaker):
+async def handle_incoming_pipeline(consumer: AIOKafkaConsumer, subject: GridControlSubject, session_factory: async_sessionmaker, producer: AIOKafkaProducer):
     async for msg in consumer:
         try:
             # =========================================================
@@ -210,18 +230,32 @@ async def handle_incoming_pipeline(consumer: AIOKafkaConsumer, subject: GridCont
                     logging.info(f"💾 Regional audit log recorded cleanly for transaction {command.command_id}.")
 
         except Exception as e:
-            logging.error(f"Error handling downstream action control pipeline: {str(e)}")
+            logging.error(
+                f"Error handling downstream action control pipeline: {str(e)}"
+            )
+
+            try:
+                await route_to_dlq(
+                    producer,
+                    msg.value,
+                    str(e)
+                )
+            except Exception as dlq_err:
+                logging.critical(f"DLQ failed: {dlq_err}")
 
 # --- Fault-Tolerant Kafka Bootstrapping ---
 async def start_kafka_client_with_retry(client, label: str):
     backoff = 1.0
+    # Objenin kendi sınıf adını alır (AIOKafkaConsumer veya AIOKafkaProducer)
+    client_type = client.__class__.__name__ 
+    
     while True:
         try:
             await client.start()
-            logging.info(f"{label} Kafka Consumer started successfully.")
+            logging.info(f"{label} {client_type} started successfully.")
             return
         except Exception as exc:
-            logging.warning(f"Unable to start Kafka Consumer for {label}: {exc}. Retrying in {backoff:.1f}s...")
+            logging.warning(f"Unable to start {client_type} for {label}: {exc}. Retrying in {backoff:.1f}s...")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 10.0)
 
@@ -244,16 +278,21 @@ async def main():
         bootstrap_servers=KAFKA_BROKER,
         group_id="action-gateway-group"
     )
+    producer = AIOKafkaProducer(
+    bootstrap_servers=KAFKA_BROKER
+)
     
     # Yeni eklenen otonom onarım bağlantı fonksiyonumuz
     await start_kafka_client_with_retry(consumer, "Action Gateway Service")
-    
+    await start_kafka_client_with_retry(producer, "Action Gateway Service")
+
     logging.info(f"Action Gateway Service active. Monitoring topics: ['{ALERT_TOPIC}', '{TREND_TOPIC}']...")
 
     try:
-        await handle_incoming_pipeline(consumer, control_subject, async_sessionmaker_factory)
+        await handle_incoming_pipeline(consumer, control_subject, async_sessionmaker_factory, producer)
     finally:
         await consumer.stop()
+        await producer.stop()
         await engine.dispose()
 
 if __name__ == "__main__":
