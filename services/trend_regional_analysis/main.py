@@ -3,11 +3,29 @@ import logging
 import os
 import uuid
 import time
+import math
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 import redis.asyncio as aioredis
 
 # Import our updated compiled protobuf definitions
 import telemetry_pb2
+
+def calculate_slope(values):
+    """Basit doğrusal eğim hesaplaması."""
+    if len(values) < 2: return 0.0
+    x = list(range(len(values)))
+    n = len(values)
+    sum_x = sum(x)
+    sum_y = sum(values)
+    sum_xy = sum(i * v for i, v in zip(x, values))
+    sum_xx = sum(i * i for i in x)
+    return (n * sum_xy - sum_x * sum_y) / (n * sum_xx - sum_x**2) if (n * sum_xx - sum_x**2) != 0 else 0.0
+
+def calculate_variance(values):
+    """Varyans hesaplaması."""
+    if len(values) < 2: return 0.0
+    mean = sum(values) / len(values)
+    return sum((v - mean) ** 2 for v in values) / len(values)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -30,59 +48,112 @@ async def route_to_dlq(producer: AIOKafkaProducer, raw_bytes: bytes, reason: str
         logging.critical(f"Trend DLQ Pipeline Failed! Cannot dump payload: {str(e)}")
 
 
+
 # --- Stateful Regional Analytics Processor ---
 async def process_trends(
     event: telemetry_pb2.TelemetryDomainEvent, 
     redis_client: aioredis.Redis, 
     producer: AIOKafkaProducer
 ):
-    # Dynamically correlate individual meters into a macro grid region
-    # For this simulation, we group all incoming meters into a single zone
     region_id = "ZONE-ALPHA"
     region_window_key = f"region:{region_id}:consumption_window"
+    # BİREYSEL TAKİP İÇİN YENİ ANAHTAR
+    meter_window_key = f"meter:{event.meter_id}:consumption_window"
 
-    # 1. Pipeline atomic window mutations to our Redis in-memory cache
+    # 1. Pipeline atomic window mutations
     async with redis_client.pipeline(transaction=True) as pipe:
-        # Append the current consumption rate metrics to the regional list
+        # BÖLGESEL PENCEREYİ GÜNCELLE
         pipe.lpush(region_window_key, event.consumption_rate)
-        # Keep the list trimmed to act as a sliding time window
         pipe.ltrim(region_window_key, 0, SLIDING_WINDOW_SIZE - 1)
-        # Fetch all values residing in the regional window
         pipe.lrange(region_window_key, 0, -1)
         
-        _, _, raw_values = await pipe.execute()
+        # BİREYSEL PENCEREYİ GÜNCELLE
+        pipe.lpush(meter_window_key, event.consumption_rate)
+        pipe.ltrim(meter_window_key, 0, SLIDING_WINDOW_SIZE - 1)
+        pipe.lrange(meter_window_key, 0, -1)
+        
+        # Pipeline'ı tek seferde çalıştır (Redis'e tek gidiş-dönüş maliyeti)
+        results = await pipe.execute()
 
-    # 2. Extract and parse time-series analytical boundaries
-    window_values = [float(val.decode('utf-8')) for val in raw_values]
-    rolling_avg = sum(window_values) / len(window_values)
+    # Redis'ten dönen 6 işlemlik sonucun 3.sü bölgesel, 6.sı bireysel verilerdir
+    region_raw_values = results[2]
+    meter_raw_values = results[5]
 
+    # 2. BÖLGESEL (Makro) Hareketli Ortalama Hesabı
+    region_values = [float(val.decode('utf-8')) for val in region_raw_values]
+    region_rolling_avg = sum(region_values) / len(region_values) if region_values else 0
+    region_slope = calculate_slope(region_values)
+    region_variance = calculate_variance(region_values)
+   
+    # 3. BİREYSEL (Mikro) Hareketli Ortalama Hesabı
+    meter_values = [float(val.decode('utf-8')) for val in meter_raw_values]
+    meter_rolling_avg = sum(meter_values) / len(meter_values)
+    
     logging.info(
-        f"📈 [Trend Engine] Region: {region_id} | Updated By: {event.meter_id} | "
-        f"Current Rate: {event.consumption_rate:.2f} kW | "
-        f"Regional Rolling Avg ({len(window_values)} pts): {rolling_avg:.2f} kW"
+        f"📈 [Trend Engine] Region: {region_id} | Meter: {event.meter_id} | "
+        f"Rate: {event.consumption_rate:.2f}kW | "
+        f"Meter Avg: {meter_rolling_avg:.2f}kW | Region Avg: {region_rolling_avg:.2f}kW | "
+        f"Slope: {region_slope:.4f} | Var: {region_variance:.4f}"
     )
 
-    # 3. Evaluate multi-meter aggregate patterns for load anomalies
-    if rolling_avg > REGIONAL_OVERLOAD_THRESHOLD:
-        logging.warning(
-            f"⚠️ [Trend Engine] Grid anomaly detected in {region_id}! "
-            f"Rolling consumption average ({rolling_avg:.2f} kW) crosses safety threshold."
-        )
+    # 3. Anomali Kontrolleri ve Kafka Olayı (Event) Üretimi
+    # En tehlikeli/kritik durumdan en hafif duruma doğru sıralanmış bir Karar Ağacı
+    trend_anomaly_event = None
 
-        # Formulate the explicit typed TrendRegionEvent from your proposal specification
+    # Öncelik 1: Gerçekleşmiş Bölgesel Aşırı Yük (En kritik sınır aşımı)
+    if region_rolling_avg > REGIONAL_OVERLOAD_THRESHOLD:
+        logging.warning(f"⚠️ [Trend Engine] Regional OVERLOAD in {region_id}! Avg: {region_rolling_avg:.2f}kW")
         trend_anomaly_event = telemetry_pb2.TrendRegionEvent(
-            event_id=str(uuid.uuid4()), # Event tracing key
+            event_id=str(uuid.uuid4()),
             region_id=region_id,
             anomaly_type="RegionalOverloadDetected",
-            moving_average=rolling_avg,
+            moving_average=region_rolling_avg,
+            timestamp=int(time.time() * 1000)
+        )
+        
+    # Öncelik 2: Şebeke Kararsızlığı (Yüksek varyans, cihaz ömürlerini tehdit eder)
+    elif region_variance > 1.5:
+        logging.error(f"⚡ [Trend Engine] GridInstabilityDetected in {region_id}! Variance: {region_variance:.2f}")
+        trend_anomaly_event = telemetry_pb2.TrendRegionEvent(
+            event_id=str(uuid.uuid4()),
+            region_id=region_id,
+            anomaly_type="GridInstabilityDetected",
+            moving_average=region_rolling_avg, 
+            timestamp=int(time.time() * 1000)
+        )
+        
+    # Öncelik 3: Kestirimci Uyarı / Hızlı Yük Artışı (Tehlikeye doğru gidiş)
+    elif region_slope > 0.5:
+        logging.warning(f"🚀 [Trend Engine] Predictive Alert: Rapid load growth in {region_id}!")
+        trend_anomaly_event = telemetry_pb2.TrendRegionEvent(
+            event_id=str(uuid.uuid4()),
+            region_id=region_id,
+            anomaly_type="RapidLoadGrowthDetected",
+            moving_average=region_rolling_avg,
             timestamp=int(time.time() * 1000)
         )
 
-        # 4. Asynchronously broadcast the decision event to Kafka
-        await producer.send_and_wait(TREND_TOPIC, trend_anomaly_event.SerializeToString())
+    # Öncelik 4: Bireysel Şüpheli Tüketim (Bölge güvende ama tek bir sayaç çok akım çekiyor)
+    elif meter_rolling_avg > 3.0:
+        logging.warning(f"🕵️ [Trend Engine] Suspicious Consumption on {event.meter_id}! Avg: {meter_rolling_avg:.2f}kW")
+        trend_anomaly_event = telemetry_pb2.TrendRegionEvent(
+            event_id=str(uuid.uuid4()),
+            region_id=region_id,
+            anomaly_type="SuspiciousConsumptionPattern",
+            moving_average=meter_rolling_avg,
+            timestamp=int(time.time() * 1000)
+        )
+
+    # 4. Eğer bir alarm oluştuysa (Event None değilse) Kafka'ya fırlat
+    if trend_anomaly_event:
+        await producer.send_and_wait(
+            TREND_TOPIC,
+            trend_anomaly_event.SerializeToString()
+        )
+
         logging.info(
-            f"📤 Dispatched regional alert {trend_anomaly_event.anomaly_type} "
-            f"(ID: {trend_anomaly_event.event_id}) to '{TREND_TOPIC}' topic."
+            f"📤 Dispatched {trend_anomaly_event.anomaly_type} "
+            f"(ID: {trend_anomaly_event.event_id}) to '{TREND_TOPIC}'"
         )
 
 
