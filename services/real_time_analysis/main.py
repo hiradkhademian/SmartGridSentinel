@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
 SRC_TOPIC = "telemetry-stream"
 ALERT_TOPIC = "emergency-alerts"
-DLQ_TOPIC = "telemetry-dlq"
+DLQ_TOPIC = "emergency-alerts-dlq"
 
 # --- Strategy Design Pattern for Threshold Analysis ---
 class AnalysisStrategy:
@@ -56,7 +56,7 @@ class GridAnalyzer:
 
 # --- Error Isolation & DLQ Routing ---
 async def route_to_dlq(producer: AIOKafkaProducer, raw_bytes: bytes, reason: str):
-    """Routes an unprocessable raw payload straight into the telemetry-dlq topic."""
+    """Routes failed alert analysis events into emergency-alerts-dlq."""
     try:
         logging.error(f"❌ Route to DLQ triggered: {reason}")
         await producer.send_and_wait(DLQ_TOPIC, raw_bytes)
