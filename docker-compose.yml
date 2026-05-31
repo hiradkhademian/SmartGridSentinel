@@ -88,5 +88,17 @@ services:
     depends_on:
       - ingestion-service
 
+
+  dlq-monitor:
+    build: ./services/dlq_monitor
+    container_name: dlq-monitor-service
+    depends_on:
+      - kafka
+      - postgres
+    environment:
+      KAFKA_BROKER: "kafka:29092"
+      DATABASE_URL: "postgresql+asyncpg://sentinel_admin:sentinel_password@postgres:5432/smartgrid_db"
+    restart: unless-stopped
+    
 volumes:
   pgdata:
