@@ -24,13 +24,34 @@ class VoltageSpikeStrategy(AnalysisStrategy):
     def check(self, event: telemetry_pb2.TelemetryDomainEvent) -> bool:
         # Evaluate critical threshold violation (e.g., Voltage > 240V)
         return event.voltage > 240.0
+    
+class CurrentSpikeStrategy(AnalysisStrategy):
+    def check(self, event: telemetry_pb2.TelemetryDomainEvent) -> bool:
+        return event.current > 15.0
+    
+class PowerSpikeStrategy(AnalysisStrategy):
+    def check(self, event: telemetry_pb2.TelemetryDomainEvent) -> bool:
+        power = event.voltage * event.current
+        return power > 4000.0
+    
+class BlackoutStrategy(AnalysisStrategy):
+    def check(self, event: telemetry_pb2.TelemetryDomainEvent) -> bool:
+        return event.voltage < 200.0
 
 class GridAnalyzer:
     def __init__(self):
-        self._strategies = [VoltageSpikeStrategy()]
+        self._strategies = [
+            ("VoltageSpikeDetected", VoltageSpikeStrategy()),
+            ("CurrentSpikeDetected", CurrentSpikeStrategy()),
+            ("PowerSpikeDetected", PowerSpikeStrategy()),
+            ("BlackoutDetected", BlackoutStrategy())
+        ]
 
-    def evaluate(self, event: telemetry_pb2.TelemetryDomainEvent) -> bool:
-        return any(strategy.check(event) for strategy in self._strategies)
+    def evaluate(self, event):
+        for name, strategy in self._strategies:
+            if strategy.check(event):
+                return name
+        return None
 
 
 # --- Error Isolation & DLQ Routing ---
@@ -56,19 +77,26 @@ async def process_message(msg, analyzer: GridAnalyzer, producer: AIOKafkaProduce
             event = telemetry_pb2.TelemetryDomainEvent()
             event.ParseFromString(raw_payload)
             
-            if analyzer.evaluate(event):
-                logging.warning(f"🚨 ANOMALY DETECTED: Critical threshold breach on meter {event.meter_id} ({event.voltage:.2f}V)!")
-                
-                # Formulate the explicit typed EmergencyAlertEvent from your proposal specification
+            alert_type = analyzer.evaluate(event)
+
+            if alert_type:
+                logging.warning(f"🚨 ANOMALY DETECTED: {alert_type} on meter {event.meter_id}")
+
+                trigger_value = (
+                    event.voltage if "Voltage" in alert_type else
+                    event.current if "Current" in alert_type else
+                    event.voltage * event.current if "Power" in alert_type else
+                    event.voltage
+                )
+
                 alert_event = telemetry_pb2.EmergencyAlertEvent(
                     event_id=str(uuid.uuid4()),
                     meter_id=event.meter_id,
-                    alert_type="VoltageSpikeDetected" if event.voltage > 240.0 else "EmergencyDetected",
-                    trigger_value=event.voltage,
+                    alert_type=alert_type,
+                    trigger_value=trigger_value,
                     timestamp=int(time.time() * 1000)
                 )
-                
-                # Serialise and dispatch safely to emergency-alerts topic
+
                 await producer.send_and_wait(ALERT_TOPIC, alert_event.SerializeToString())
                 logging.info(f"Dispatched typed alert {alert_event.alert_type} (ID: {alert_event.event_id}) to '{ALERT_TOPIC}' topic.")
             return
