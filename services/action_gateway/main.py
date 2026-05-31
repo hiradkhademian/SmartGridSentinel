@@ -57,17 +57,16 @@ class MockEngineChannelObserver(GridControlObserver):
                 backoff = 0.5
                 while True:
                     try:
-                        logging.info(f"🔄 [Retry Loop] Dispatching command {command.command_id} to meter {command.meter_id}...")
-                        # Fire command over gRPC stub with a strict timeout window
+                        cmd_string_name = telemetry_pb2.CommandType.Name(command.type)
+                        logging.info(f"🔄 [Retry Loop] Dispatching {cmd_string_name} (ID: {command.command_id}) to {command.meter_id}...")
                         ack: telemetry_pb2.CommandAcknowledgement = await stub.ExecuteCommand(command, timeout=2.0)
                         
                         if ack.success:
-                            logging.info(f"✅ [ACK Received] Meter {ack.meter_id} verified execution of command {ack.command_id}.")
+                            logging.info(f"✅ [ACK Received] Target {ack.meter_id} verified execution of command {ack.command_id}.")
                             return True
                     except grpc.RpcError as grpc_err:
                         logging.warning(f"⚠️ [Delivery Failure] Connection drop or timeout: {grpc_err.details()}. Retrying...")
                     
-                    # Exponential Backoff up to a reasonable cap
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 5.0)
 
@@ -84,28 +83,19 @@ class GridControlSubject:
         self._observers.append(observer)
 
     async def notify_observers(self, command: telemetry_pb2.GridControlCommand) -> bool:
-        # Broadcasts command requests through managed connection observers
         for observer in self._observers:
             success = await observer.update(command)
             if success:
                 return True
         return False
 
-
-# --- Idempotency & Database Verification Helper ---
-async def is_event_duplicate(session_factory: async_sessionmaker, event_id: str) -> bool:
-    async with session_factory() as session:
-        result = await session.execute(
-            session.query(CommandAuditLog).filter(CommandAuditLog.event_id == event_id)
-        )
-        return result.scalar() is not None
-
-
 # --- Event Processing Pipelines ---
 async def handle_incoming_pipeline(consumer: AIOKafkaConsumer, subject: GridControlSubject, session_factory: async_sessionmaker):
     async for msg in consumer:
         try:
-            # Route processing based on the source message topic origin
+            # =========================================================
+            # 1. REAL-TIME ANALYSIS HANDLER (Emergency Alerts)
+            # =========================================================
             if msg.topic == ALERT_TOPIC:
                 alert = telemetry_pb2.EmergencyAlertEvent()
                 alert.ParseFromString(msg.value)
@@ -116,25 +106,33 @@ async def handle_incoming_pipeline(consumer: AIOKafkaConsumer, subject: GridCont
                 async with session_factory() as session:
                     existing = await session.get(CommandAuditLog, alert.event_id)
                     if existing:
-                        logging.warning(f"⏭️ [Idempotency Block] Event {alert.event_id} already processed. Skipping duplicate command.")
+                        logging.warning(f"⏭️ [Idempotency Block] Event {alert.event_id} already processed. Skipping.")
                         continue
 
-                # Map to report specific command definitions
-                cmd_type = telemetry_pb2.CommandType.CUT_POWER if alert.alert_type == "VoltageSpikeDetected" else telemetry_pb2.CommandType.RESTART_METER
-                cmd_name = "CutPowerCommand" if cmd_type == telemetry_pb2.CommandType.CUT_POWER else "RestartMeterCommand"
+                # --- POLIMORFİK KARAR AĞACI ---
+                # Yangın/Aşırı Yük tehlikelerinde gücü tamamen kes
+                if alert.alert_type in ["VoltageSpikeDetected", "PowerSpikeDetected"]:
+                    cmd_type = telemetry_pb2.CommandType.CUT_POWER
+                    cmd_name = "CutPowerCommand"
+                # Akım dalgalanması veya düşük voltajda cihazı yeniden başlatıp kurtarmayı dene
+                elif alert.alert_type in ["CurrentSpikeDetected", "BlackoutDetected"]:
+                    cmd_type = telemetry_pb2.CommandType.RESTART_METER
+                    cmd_name = "RestartMeterCommand"
+                else:
+                    cmd_type = telemetry_pb2.CommandType.CUT_POWER
+                    cmd_name = "EmergencyCutPowerCommand"
 
                 command = telemetry_pb2.GridControlCommand(
                     command_id=alert.event_id,
                     meter_id=alert.meter_id,
                     type=cmd_type,
-                    details=f"Triggered by immediate real-time safety breach value: {alert.trigger_value}"
+                    details=f"[{alert.alert_type}] Triggered by real-time safety breach value: {alert.trigger_value:.2f}"
                 )
 
                 # Orchestrate control plane broadcast through our active Observers
                 ack_status = await subject.notify_observers(command)
                 
                 if ack_status:
-                    # Persist permanent operational tracking log inside PostgreSQL
                     async with session_factory() as session:
                         async with session.begin():
                             audit = CommandAuditLog(
@@ -145,8 +143,11 @@ async def handle_incoming_pipeline(consumer: AIOKafkaConsumer, subject: GridCont
                                 ack_received=datetime.utcnow()
                             )
                             await session.merge(audit)
-                    logging.info(f"💾 Command audit log recorded cleanly for transaction {command.command_id}.")
+                    logging.info(f"💾 {cmd_name} audit log recorded cleanly for transaction {command.command_id}.")
 
+            # =========================================================
+            # 2. TREND & REGIONAL ANALYSIS HANDLER (Macro Events)
+            # =========================================================
             elif msg.topic == TREND_TOPIC:
                 trend = telemetry_pb2.TrendRegionEvent()
                 trend.ParseFromString(msg.value)
@@ -157,12 +158,41 @@ async def handle_incoming_pipeline(consumer: AIOKafkaConsumer, subject: GridCont
                     if await session.get(CommandAuditLog, trend.event_id):
                         continue
 
-                # Map regional trends to ThrottleConsumptionCommand
+                # --- TREND KARAR AĞACI ---
+                if trend.anomaly_type == "RegionalOverloadDetected":
+                    cmd_type = telemetry_pb2.CommandType.THROTTLE_CONSUMPTION
+                    cmd_name = "ThrottleConsumptionCommand"
+                    target_id = f"REGIONAL-GATEWAY-{trend.region_id}"
+                    details = f"Triggered by {trend.anomaly_type}. Throttling region. Rolling Avg: {trend.moving_average:.2f} kW"
+                
+                elif trend.anomaly_type == "SuspiciousConsumptionPattern":
+                    cmd_type = telemetry_pb2.CommandType.THROTTLE_CONSUMPTION
+                    cmd_name = "InvestigateConsumptionCommand"
+                    target_id = f"REGION-{trend.region_id}-SUSPICIOUS"
+                    details = f"Triggered by {trend.anomaly_type}. Flagging for steady high usage: {trend.moving_average:.2f} kW"
+                
+                elif trend.anomaly_type == "GridInstabilityDetected":
+                    cmd_type = telemetry_pb2.CommandType.THROTTLE_CONSUMPTION
+                    cmd_name = "GridStabilizationCommand"
+                    target_id = f"REGIONAL-GATEWAY-{trend.region_id}"
+                    details = f"Grid instability detected. Variance-based anomaly."
+
+                elif trend.anomaly_type == "RapidLoadGrowthDetected":
+                    cmd_type = telemetry_pb2.CommandType.THROTTLE_CONSUMPTION
+                    cmd_name = "PreventiveLoadControlCommand"
+                    target_id = f"REGIONAL-GATEWAY-{trend.region_id}"
+                    details = f"Rapid load growth detected. Slope-based anomaly."
+                else:
+                    cmd_type = telemetry_pb2.CommandType.THROTTLE_CONSUMPTION
+                    cmd_name = "GenericTrendCommand"
+                    target_id = f"REGIONAL-GATEWAY-{trend.region_id}"
+                    details = f"Trend anomaly: {trend.moving_average:.2f} kW"
+
                 command = telemetry_pb2.GridControlCommand(
                     command_id=trend.event_id,
-                    meter_id=f"REGIONAL-GATEWAY-{trend.region_id}", # Route command to a group/regional context
-                    type=telemetry_pb2.CommandType.THROTTLE_CONSUMPTION,
-                    details=f"Triggered by {trend.anomaly_type}. Global Moving Average: {trend.moving_average:.2f} kW"
+                    meter_id=target_id, 
+                    type=cmd_type,
+                    details=details
                 )
 
                 ack_status = await subject.notify_observers(command)
@@ -172,14 +202,28 @@ async def handle_incoming_pipeline(consumer: AIOKafkaConsumer, subject: GridCont
                             audit = CommandAuditLog(
                                 event_id=command.command_id,
                                 target_id=command.meter_id,
-                                command_type="ThrottleConsumptionCommand",
+                                command_type=cmd_name,
                                 details=command.details,
                                 ack_received=datetime.utcnow()
                             )
                             await session.merge(audit)
+                    logging.info(f"💾 Regional audit log recorded cleanly for transaction {command.command_id}.")
 
         except Exception as e:
             logging.error(f"Error handling downstream action control pipeline: {str(e)}")
+
+# --- Fault-Tolerant Kafka Bootstrapping ---
+async def start_kafka_client_with_retry(client, label: str):
+    backoff = 1.0
+    while True:
+        try:
+            await client.start()
+            logging.info(f"{label} Kafka Consumer started successfully.")
+            return
+        except Exception as exc:
+            logging.warning(f"Unable to start Kafka Consumer for {label}: {exc}. Retrying in {backoff:.1f}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 10.0)
 
 async def main():
     engine = create_async_engine(DATABASE_URL, echo=False)
@@ -200,7 +244,10 @@ async def main():
         bootstrap_servers=KAFKA_BROKER,
         group_id="action-gateway-group"
     )
-    await consumer.start()
+    
+    # Yeni eklenen otonom onarım bağlantı fonksiyonumuz
+    await start_kafka_client_with_retry(consumer, "Action Gateway Service")
+    
     logging.info(f"Action Gateway Service active. Monitoring topics: ['{ALERT_TOPIC}', '{TREND_TOPIC}']...")
 
     try:
