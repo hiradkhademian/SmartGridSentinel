@@ -94,9 +94,21 @@ class TelemetryIngestionServicer(telemetry_pb2_grpc.TelemetryIngestionServiceSer
 
         except Exception as e:
             logging.error(f"Failed to process telemetry packet: {str(e)}")
+
+            try:
+                # ingestion DLQ (senin mimarine uygun tek DLQ)
+                await self.producer.send_and_wait(
+                    DLQ_TOPIC,
+                    request.SerializeToString()
+                )
+            except Exception as dlq_err:
+                logging.critical(f"DLQ write failed: {dlq_err}")
+
             context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details("Internal ingestion loop failure.")
-            return telemetry_pb2.IngestionResponse(success=False, message=str(e))
+            return telemetry_pb2.IngestionResponse(
+                success=False,
+                message="Internal ingestion failure"
+            )
 
 async def start_kafka_producer_with_retry(producer: AIOKafkaProducer, label: str):
     backoff = 1.0
