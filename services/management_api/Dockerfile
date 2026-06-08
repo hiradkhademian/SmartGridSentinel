@@ -5,6 +5,9 @@ WORKDIR /app
 # Install essential system dependencies for building extensions if needed
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    netcat-openbsd \
+    procps \
+    curl \
     && rm -rf /lib/apt/lists/*
 
 # Copy and install shared Python requirements
@@ -17,5 +20,8 @@ COPY . .
 # Environment flag to force unbuffered logging output inside Docker logs
 ENV PYTHONUNBUFFERED=1
 
-# The execution command is overridden individually inside the docker-compose file
-CMD ["python", "main.py"]
+# Run FastAPI via Uvicorn in the container
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# Healthcheck: call the management API health endpoint
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD curl -f http://localhost:8000/healthz || exit 1

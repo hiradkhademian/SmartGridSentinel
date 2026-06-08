@@ -5,6 +5,8 @@ WORKDIR /app
 # Install essential system dependencies for building extensions if needed
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    netcat-openbsd \
+    procps \
     && rm -rf /lib/apt/lists/*
 
 # Copy and install shared Python requirements
@@ -18,4 +20,8 @@ COPY . .
 ENV PYTHONUNBUFFERED=1
 
 # The execution command is overridden individually inside the docker-compose file
+# Default execution
 CMD ["python", "main.py"]
+
+# Healthcheck: ensure gRPC port is listening
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD nc -z localhost 50051 || exit 1
