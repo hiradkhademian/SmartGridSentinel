@@ -102,14 +102,14 @@ async def run_mock_engine(original_meter_id: str, stub: telemetry_pb2_grpc.Telem
                 current *= 0.6 
             
             # 🟢 GÜNCELLENDİ: Daha agresif ve çeşitli DLQ Chaos Enjeksiyonu (%2)
-            if random.random() < 0.02:
+            if random.random() < 0.01:
                 logging.warning(f"🧪 [CHAOS TEST] Injecting deliberately corrupted packet for DLQ validation!")
                 # Geçersiz formatlar veya boş ID'ler
                 meter_id = random.choice(["CORRUPT_METER", "INVALID_!@#", ""]) 
                 base_voltage = -999.0 
             
             # 🟢 GÜNCELLENDİ: Anomali isimleri Action Gateway ile birebir eşitlendi
-            elif random.random() < 0.05: 
+            elif random.random() < 0.02: 
                 anomaly_type = random.choice([
                     "VoltageSpikeDetected", 
                     "CurrentSpikeDetected", 
