@@ -77,6 +77,20 @@ services:
       - mock-engine
     restart: on-failure
 
+  management_api:
+    build: ./services/management_api
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BROKER: "kafka:29092"
+      REDIS_URL: "redis://redis:6379"
+      DATABASE_URL: "postgresql+asyncpg://sentinel_admin:sentinel_password@postgres:5432/smartgrid_db"
+    depends_on:
+      - kafka
+      - redis
+      - postgres
+    restart: unless-stopped
+
   mock-engine:
     build: ./services/mock_engine
     command: ["python", "simulator.py"]
