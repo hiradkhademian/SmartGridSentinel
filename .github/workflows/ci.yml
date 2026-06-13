@@ -47,7 +47,7 @@ jobs:
     needs: lint-and-validate
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
+      fail-fast: false  # Continue even if some builds fail
       matrix:
         # Define a build execution matrix to compile all services concurrently
         service: [
