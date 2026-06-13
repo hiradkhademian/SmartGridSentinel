@@ -17,7 +17,7 @@ jobs:
       - name: Setup Python Environment
         uses: actions/setup-python@v4
         with:
-          python-node-version: '3.11'
+          python-version: '3.11'
           cache: 'pip'
 
       - name: Install Base and Tooling Dependencies
@@ -36,10 +36,10 @@ jobs:
         run: |
           # Compiles proto structures dynamically to ensure no breaking structural variations exist
           python -m grpc_tools.protoc \
-            --proto_path=services/ingestion \
-            --python_out=services/ingestion \
-            --grpc_python_out=services/ingestion \
-            services/ingestion/telemetry.proto
+            --proto_path=proto \
+            --python_out=proto \
+            --grpc_python_out=proto \
+            proto/telemetry.proto
           echo "✅ Protobuf schema interface compiled successfully without structural regressions."
 
   # --- STAGE 2: CONTAINER DEPLOYMENT INTEGRITY VERIFICATION ---
