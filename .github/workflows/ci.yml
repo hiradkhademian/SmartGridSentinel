@@ -63,14 +63,8 @@ jobs:
       - name: Checkout Monorepo Codebase
         uses: actions/checkout@v3
 
-      - name: Set up Docker Buildx
-        uses: actions/docker-setup-buildx-action@v2
-
       - name: Verify Service Container Construction
-        uses: docker/build-push-action@v4
-        with:
-          context: ./services/${{ matrix.service }}
-          file: ./services/${{ matrix.service }}/Dockerfile
-          push: false  # Do not push images to a registry during testing validation stages
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        run: |
+          echo "🐳 Building Docker image for ${{ matrix.service }} service..."
+          docker build -t smartgrid-${{ matrix.service }}:latest ./services/${{ matrix.service }}
+          echo "✅ Successfully built image for ${{ matrix.service }} service"
